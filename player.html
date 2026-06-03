@@ -600,6 +600,12 @@ async function loadDanmaku() {
             }
         }
 
+        // Normalize timestamps: recording tool outputs milliseconds, but some
+        // danmaku files may use seconds. Detect and convert to seconds uniformly.
+        const isMs = raw.length > 0 && raw[0].timestamp > 1e12;
+        const tsScale = isMs ? 1000 : 1;
+        for (const d of raw) d.timestamp = d.timestamp / tsScale;
+
         state.danmakuRaw = raw;
         state.videoStartTs = raw[0]?.timestamp || 0;
 
@@ -623,6 +629,7 @@ function applyDanmakuDensity() {
     if (settings.density >= 1) {
         state.danmakuAll = raw.map(d => ({
             ...d,
+            rawTime: d.timestamp - state.videoStartTs,
             videoTime: d.timestamp - state.videoStartTs + settings.offset,
         }));
     } else {
@@ -631,6 +638,7 @@ function applyDanmakuDensity() {
             if (Math.random() < settings.density) {
                 state.danmakuAll.push({
                     ...raw[i],
+                    rawTime: raw[i].timestamp - state.videoStartTs,
                     videoTime: raw[i].timestamp - state.videoStartTs + settings.offset,
                 });
             }
@@ -683,7 +691,7 @@ function spawnDanmaku(danmaku) {
     const laneCount = getLaneCount();
 
     ctx.font = `${settings.fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`;
-    const prefix = settings.showDanmakuTime ? `[${formatTime(danmaku.videoTime)}] ` : '';
+    const prefix = settings.showDanmakuTime ? `[${formatTime(danmaku.rawTime)}] ` : '';
     const text = prefix + danmaku.content;
     const textWidth = ctx.measureText(text).width;
 
