@@ -268,6 +268,8 @@ const state = {
     _estDuration: 0,
     _rebuilding: false,
     _pendingRebuild: null,
+    _rebuildSeekComp: false,
+    _seekResume: false,
     playerInitialized: false,
     resizeObserver: null,
 };
@@ -426,6 +428,16 @@ function setupVideoEvents() {
     video.addEventListener('playing', () => loadingEl.classList.remove('active'));
     video.addEventListener('seeked', () => {
         state.isSeeking = false;
+        // Compensate for flv.js auto-seek after rebuild ("stuck at 0" detection)
+        if (state._rebuildSeekComp) {
+            state._rebuildSeekComp = false;
+            const pt = (state.flvPlayer && isFinite(state.flvPlayer.currentTime))
+                ? state.flvPlayer.currentTime : video.currentTime;
+            if (pt > 0.5) {
+                state._timeOffset -= pt;
+                updateTimeDisplay();
+            }
+        }
         onSeekComplete();
         loadingEl.classList.remove('active');
     });
@@ -836,6 +848,7 @@ function updateProgressBar() {
 }
 
 function updateTimeDisplay() {
+    if (isDragging) return;
     timeDisplay.textContent = formatTime(getCurrentTime()) + ' / ' + formatTime(getDuration());
 }
 
@@ -850,6 +863,7 @@ function seekTo(time) {
     }
 
     state.isSeeking = true;
+    state._rebuildSeekComp = false; // user-initiated seek, cancel rebuild compensation
     loadingEl.classList.add('active');
 
     // video.buffered is relative to the player timeline (0-based).
@@ -1033,6 +1047,9 @@ async function findFlvSyncPoint(file, approxByte) {
 async function rebuildPlayerAt(targetTime) {
     if (!state.flvFile || !state._flvHeader) return;
     state._rebuilding = true;
+    // Set offset immediately so getCurrentTime() is accurate during rebuild,
+    // preventing stale _pendingRebuild values from rapid key presses.
+    state._timeOffset = targetTime;
     console.log('Rebuilding player at', targetTime);
 
     // Calculate byte offset (approximate — assumes constant bitrate)
@@ -1109,20 +1126,19 @@ async function rebuildPlayerAt(targetTime) {
         state.isSeeking = false;
         loadingEl.classList.remove('active');
         state._rebuilding = false;
+        // Flag: next non-user seek (flv.js "stuck at 0" auto-seek) needs compensation
+        state._rebuildSeekComp = true;
 
         // Process any pending seek that arrived during rebuild
         if (state._pendingRebuild != null) {
             const pending = state._pendingRebuild;
             state._pendingRebuild = null;
-            setTimeout(() => seekTo(pending), 50);
+            setTimeout(() => seekTo(pending), 150);
         }
     });
 
     state.flvPlayer.attachMediaElement(video);
     state.flvPlayer.load();
-
-    // Offset: the new player's time 0 = targetTime in the original video
-    state._timeOffset = targetTime;
 
     // Reset danmaku to match new position
     state.danmakuActive = [];
@@ -1395,10 +1411,12 @@ document.addEventListener('keydown', (e) => {
             break;
         case 'ArrowLeft':
             e.preventDefault();
+            if (!e.repeat && !video.paused) { video.pause(); state._seekResume = true; }
             seekTo(getCurrentTime() - 5);
             break;
         case 'ArrowRight':
             e.preventDefault();
+            if (!e.repeat && !video.paused) { video.pause(); state._seekResume = true; }
             seekTo(getCurrentTime() + 5);
             break;
         case 'ArrowUp':
@@ -1423,6 +1441,15 @@ document.addEventListener('keydown', (e) => {
                 playerContainer.requestFullscreen();
             }
             break;
+    }
+});
+
+document.addEventListener('keyup', (e) => {
+    if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+        if (state._seekResume) {
+            state._seekResume = false;
+            video.play().catch(() => {});
+        }
     }
 });
 
