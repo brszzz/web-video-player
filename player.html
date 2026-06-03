@@ -272,6 +272,8 @@ const state = {
     _estDuration: 0,
     _rebuilding: false,
     _pendingRebuild: null,
+    _initialLoadDone: false,
+    _lastRebuildTime: 0,
     playerInitialized: false,
     resizeObserver: null,
 };
@@ -396,6 +398,8 @@ async function selectFolder() {
         state._estDuration = 0;
         state._rebuilding = false;
         state._pendingRebuild = null;
+        state._initialLoadDone = false;
+        state._lastRebuildTime = 0;
         state.danmakuAll = [];
         state.danmakuRaw = [];
         state.danmakuActive = [];
@@ -493,6 +497,10 @@ function initPlayer() {
         setupCanvas();
         updateTimeDisplay();
         video.play().catch(() => {});
+        if (!state._initialLoadDone) {
+            state._initialLoadDone = true;
+            startPolling();
+        }
     });
 
     state.flvPlayer.attachMediaElement(video);
@@ -512,7 +520,6 @@ function initPlayer() {
     requestAnimationFrame(danmakuLoop);
     setInterval(updateProgressBar, 200);
     kbdHint.style.display = 'block';
-    startPolling();
 }
 
 // ============================================================
@@ -520,6 +527,7 @@ function initPlayer() {
 // ============================================================
 function startPolling() {
     stopPolling();
+    state._lastRebuildTime = 0;
     state._pollTimer = setInterval(checkFileGrowth, 2000);
 }
 
@@ -531,6 +539,8 @@ function stopPolling() {
 }
 
 async function checkFileGrowth() {
+    // Don't poll until initial load is complete
+    if (!state._initialLoadDone) return;
     if (state._rebuilding || video.paused || !state._flvFileHandle) return;
 
     try {
@@ -539,13 +549,16 @@ async function checkFileGrowth() {
         const prevSize = state._fileSize;
         state.flvFile = newFile;
         state._fileSize = newFile.size;
-        console.log('File grew:', prevSize, '->', newFile.size);
+        console.log('File grew:', (prevSize / 1024 / 1024).toFixed(1), 'MB ->', (newFile.size / 1024 / 1024).toFixed(1), 'MB');
 
         // Scale duration estimate proportionally
         if (state._estDuration > 0 && prevSize > 0) {
             state._estDuration = state._estDuration * (newFile.size / prevSize);
             updateTimeDisplay();
         }
+
+        // 10s cooldown between rebuilds to avoid thrashing
+        if (Date.now() - state._lastRebuildTime < 10000) return;
 
         // Check if near end of buffered range
         const currentTime = getCurrentTime();
@@ -554,9 +567,11 @@ async function checkFileGrowth() {
         const bufferedEnd = buffered.end(buffered.length - 1);
         const duration = getDuration();
 
+        // Rebuild only when within 3s of buffer end
         if (currentTime < bufferedEnd - 3 && bufferedEnd < duration - 3) return;
 
-        console.log('Near buffer end, auto-rebuilding at', currentTime);
+        console.log('Near buffer end (cur=' + currentTime.toFixed(1) + ' bufEnd=' + bufferedEnd.toFixed(1) + '), auto-rebuilding');
+        state._lastRebuildTime = Date.now();
         await rebuildPlayerAt(currentTime);
     } catch (e) {
         console.error('Polling check failed:', e);
