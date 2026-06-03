@@ -257,6 +257,10 @@ const state = {
     flvPlayer: null,
     _segUrl: null,
     _curBlobUrl: null,     // current blob URL for the player (may change on rebuild)
+    _flvFileHandle: null,  // FileSystemFileHandle for re-reading growing files
+    _danmakuFileHandle: null, // ditto for danmaku file
+    _fileSize: 0,          // last known file size (for detecting growth)
+    _pollTimer: null,      // setInterval ID for polling
     _flvHeader: null,      // cached FLV header bytes (first ~1024 bytes)
     _timeOffset: 0,        // offset: actual video time = player time + offset
     danmakuAll: [],        // all parsed danmaku, filtered by density
@@ -352,6 +356,7 @@ async function selectFolder() {
 
         // Clean up old player if re-selecting
         if (state.playerInitialized) {
+            stopPolling();
             if (state.flvPlayer) {
                 try {
                     state.flvPlayer.detachMediaElement();
@@ -382,7 +387,10 @@ async function selectFolder() {
         const flv = flvFiles[0];
         const danmaku = danmakuFiles[0] || null;
 
+        state._flvFileHandle = flv.handle;
+        state._danmakuFileHandle = danmaku ? danmaku.handle : null;
         state.flvFile = await flv.handle.getFile();
+        state._fileSize = state.flvFile.size;
         state.danmakuFile = danmaku ? await danmaku.handle.getFile() : null;
         state._timeOffset = 0;
         state._estDuration = 0;
@@ -504,6 +512,66 @@ function initPlayer() {
     requestAnimationFrame(danmakuLoop);
     setInterval(updateProgressBar, 200);
     kbdHint.style.display = 'block';
+    startPolling();
+}
+
+// ============================================================
+// Live-Recording Polling
+// ============================================================
+function startPolling() {
+    stopPolling();
+    state._pollTimer = setInterval(checkFileGrowth, 2000);
+}
+
+function stopPolling() {
+    if (state._pollTimer) {
+        clearInterval(state._pollTimer);
+        state._pollTimer = null;
+    }
+}
+
+async function checkFileGrowth() {
+    if (state._rebuilding || video.paused || !state._flvFileHandle) return;
+
+    try {
+        const newFile = await state._flvFileHandle.getFile();
+        if (newFile.size <= state._fileSize) return;
+        const prevSize = state._fileSize;
+        state.flvFile = newFile;
+        state._fileSize = newFile.size;
+        console.log('File grew:', prevSize, '->', newFile.size);
+
+        // Scale duration estimate proportionally
+        if (state._estDuration > 0 && prevSize > 0) {
+            state._estDuration = state._estDuration * (newFile.size / prevSize);
+            updateTimeDisplay();
+        }
+
+        // Check if near end of buffered range
+        const currentTime = getCurrentTime();
+        const buffered = video.buffered;
+        if (buffered.length === 0) return;
+        const bufferedEnd = buffered.end(buffered.length - 1);
+        const duration = getDuration();
+
+        if (currentTime < bufferedEnd - 3 && bufferedEnd < duration - 3) return;
+
+        console.log('Near buffer end, auto-rebuilding at', currentTime);
+        await rebuildPlayerAt(currentTime);
+    } catch (e) {
+        console.error('Polling check failed:', e);
+    }
+
+    // Refresh danmaku file if it grew
+    if (state._danmakuFileHandle) {
+        try {
+            const newDanmaku = await state._danmakuFileHandle.getFile();
+            if (newDanmaku.size > (state.danmakuFile?.size || 0)) {
+                state.danmakuFile = newDanmaku;
+                loadDanmaku();
+            }
+        } catch (e) { /* ignore */ }
+    }
 }
 
 // ============================================================
@@ -1031,9 +1099,18 @@ async function findFlvSyncPoint(file, approxByte) {
 }
 
 async function rebuildPlayerAt(targetTime) {
-    if (!state.flvFile || !state._flvHeader) return;
+    if (!state._flvHeader) return;
     state._rebuilding = true;
     console.log('Rebuilding player at', targetTime);
+
+    // Re-read file from handle to pick up any growth since last poll
+    if (state._flvFileHandle) {
+        try {
+            state.flvFile = await state._flvFileHandle.getFile();
+            state._fileSize = state.flvFile.size;
+        } catch (e) { /* use cached file if handle fails */ }
+    }
+    if (!state.flvFile) return;
 
     // Calculate byte offset (approximate — assumes constant bitrate)
     const duration = getDuration();
